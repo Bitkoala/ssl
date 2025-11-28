@@ -1,0 +1,1150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>SSL Certificate Tool (Pure Client-Side)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 jsrsasign (核心库: 处理 ECC/JWS/EAB) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsrsasign/10.9.0/jsrsasign-all-min.js"></script>
+    <!-- 引入 forge (辅助库: 用于 PFX 导出) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/node-forge/1.3.1/forge.min.js"></script>
+    <style>
+        .step-card {
+            transition: all 0.3s ease;
+            opacity: 0.6;
+            pointer-events: none;
+        }
+
+        .step-card.active {
+            opacity: 1;
+            pointer-events: auto;
+            border-left: 4px solid #3b82f6;
+        }
+
+        .step-card.done {
+            opacity: 0.8;
+            border-left: 4px solid #10b981;
+        }
+
+        .injection-badge {
+            display: none;
+        }
+
+        body.injected .injection-badge {
+            display: inline-block;
+        }
+
+        body.injected .manual-inject-btn {
+            display: none;
+        }
+
+        #eabSection {
+            transition: all 0.3s ease;
+        }
+
+        #eabSection.hidden {
+            display: none;
+        }
+
+        /* Loading spinner for DNS check */
+        .spinner {
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid currentColor;
+            border-radius: 50%;
+            border-top-color: transparent;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+
+<body class="bg-gray-100 min-h-screen py-8 px-4">
+
+    <div class="max-w-5xl mx-auto">
+        <!-- 头部 -->
+        <div class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-3xl font-bold text-gray-800">
+                    <span data-i18n="title_main">SSL 证书免费申请工具</span>
+                    <span class="text-sm font-normal text-gray-500">v3.8.2 Final Stable</span>
+                </h1>
+                <p class="text-sm text-gray-500 mt-1" data-i18n="title_sub">基于 Web Crypto API & ACME 协议 | 纯前端运行</p>
+            </div>
+
+            <div class="flex items-center gap-3">
+                <!-- 重置按钮 (带文字提示) -->
+                <button onclick="resetApp()" class="flex items-center text-gray-400 hover:text-red-500 transition mr-1"
+                    data-i18n-title="btn_reset_title" title="Reset / Clear Cache">
+                    <span class="text-xl">🗑️</span>
+                    <span class="text-xs font-bold ml-1 hidden sm:inline" data-i18n="btn_reset">重置</span>
+                </button>
+                <div class="h-6 w-px bg-gray-300 mx-1"></div>
+                <select onchange="changeLang(this.value)" id="langSelect" class="border rounded p-1 text-sm bg-white">
+                    <option value="zh">🇨🇳 中文</option>
+                    <option value="en">🇺🇸 English</option>
+                </select>
+                <span
+                    class="injection-badge bg-green-500 text-white px-3 py-1 rounded-full text-xs font-bold animate-pulse shadow"
+                    data-i18n="badge_injected">
+                    🚀 注入模式运行中
+                </span>
+                <button onclick="showInjectionModal()"
+                    class="manual-inject-btn text-gray-500 hover:text-blue-600 text-xs underline"
+                    data-i18n="btn_manual_inject">
+                    🔧 无法连接？点击这里
+                </button>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- 左侧：主流程 -->
+            <div class="lg:col-span-2 space-y-6">
+
+                <!-- Step 1: 账户准备 -->
+                <div id="step1" class="step-card active bg-white p-6 rounded shadow">
+                    <h2 class="text-lg font-bold text-gray-800 mb-4" data-i18n="step1_title">1. 账户准备 (ACME Account)</h2>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-xs font-bold text-gray-500 uppercase" data-i18n="label_ca">选择证书颁发机构
+                                (CA)</label>
+                            <select id="directoryUrl" class="w-full border rounded p-2 text-sm mt-1 bg-gray-50"
+                                onchange="checkEAB(); saveInputs();">
+                                <option value="https://acme-v02.api.letsencrypt.org/directory" data-i18n="opt_le_prod"
+                                    selected>Let's Encrypt (生产环境 Production)</option>
+                                <option value="https://acme.zerossl.com/v2/DV90/directory" data-i18n="opt_zerossl">
+                                    ZeroSSL (需要 EAB 凭证)</option>
+                                <option value="https://dv.acme-v02.api.pki.goog/directory" data-i18n="opt_google">Google
+                                    Trust Services (需要 EAB 凭证)</option>
+                                <option value="https://acme-staging-v02.api.letsencrypt.org/directory"
+                                    data-i18n="opt_le_staging">Let's Encrypt (测试环境 Staging)</option>
+                            </select>
+                        </div>
+
+                        <div id="eabSection" class="hidden bg-yellow-50 border border-yellow-200 p-3 rounded">
+                            <p class="text-xs text-yellow-800 mb-2 font-bold" data-i18n="eab_warning">⚠️ 该 CA 需要外部账户绑定
+                                (EAB Credentials)</p>
+                            <p id="eabHelp" class="text-xs text-gray-600 mb-2">Login to CA console to get KID & HMAC
+                                Key.</p>
+                            <div class="grid grid-cols-1 gap-2">
+                                <input id="eabKid" type="text" placeholder="EAB KID (Key ID)"
+                                    class="w-full border rounded p-2 text-xs" oninput="saveInputs()">
+                                <input id="eabHmacKey" type="password" placeholder="EAB HMAC Key"
+                                    class="w-full border rounded p-2 text-xs" oninput="saveInputs()">
+                            </div>
+                        </div>
+
+                        <div class="flex gap-2">
+                            <input id="emailInput" type="email" placeholder="you@example.com"
+                                class="flex-1 border rounded p-2 text-sm" data-i18n-placeholder="ph_email"
+                                oninput="saveInputs()">
+                            <button onclick="initAccount()"
+                                class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded text-sm transition"
+                                data-i18n="btn_connect">
+                                连接并注册
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 2: 域名与订单 -->
+                <div id="step2" class="step-card bg-white p-6 rounded shadow">
+                    <h2 class="text-lg font-bold text-gray-800 mb-4" data-i18n="step2_title">2. 域名与订单 (Create Order)
+                    </h2>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-xs font-bold text-gray-500 uppercase"
+                                data-i18n="label_domains">申请域名 (支持多个)</label>
+                            <textarea id="domainInput" rows="2" placeholder="example.com, *.example.com"
+                                class="w-full border rounded p-2 text-sm mt-1" data-i18n-placeholder="ph_domains"
+                                oninput="saveInputs()"></textarea>
+                            <p class="text-xs text-gray-400 mt-1" data-i18n="tip_wildcard">💡 提示：若需主域名和子域名同时生效，请同时填入
+                                example.com 和 *.example.com。</p>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-gray-500 uppercase"
+                                data-i18n="label_algo">证书密钥算法</label>
+                            <div class="flex gap-2 mt-1">
+                                <select id="keyAlgo" class="w-32 border rounded p-2 text-sm bg-gray-50"
+                                    onchange="saveInputs()">
+                                    <option value="RSA" selected>RSA (2048)</option>
+                                    <option value="ECC">ECC (P-256)</option>
+                                </select>
+                                <button onclick="createOrder()"
+                                    class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded text-sm transition"
+                                    data-i18n="btn_order">
+                                    申请订单
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 3: DNS 验证 -->
+                <div id="step3" class="step-card bg-white p-6 rounded shadow hidden">
+                    <h2 class="text-lg font-bold text-gray-800 mb-4" data-i18n="step3_title">3. 验证域名所有权 (DNS Challenge)
+                    </h2>
+                    <div class="bg-blue-50 border border-blue-200 p-4 rounded mb-4">
+                        <p class="text-sm text-blue-800 mb-3 font-bold">
+                            <span data-i18n="dns_guide_pre">请为以下</span>
+                            <span id="dnsCount" class="text-red-600">0</span>
+                            <span data-i18n="dns_guide_suf">个域名分别添加 TXT 记录：</span>
+                        </p>
+
+                        <!-- 动态生成验证列表 -->
+                        <div id="dnsList" class="space-y-3">
+                            <!-- JS 填充 -->
+                        </div>
+
+                        <p class="text-xs text-gray-500 mt-3" data-i18n="tip_dns_wait">
+                            💡 提示：添加后请等待 1-2 分钟让 DNS 生效。
+                        </p>
+                    </div>
+                    <button onclick="verifyAndFinalize()"
+                        class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded shadow transition"
+                        data-i18n="btn_verify">
+                        我已添加，点击验证并下载证书
+                    </button>
+                </div>
+
+                <!-- Step 4: 结果 -->
+                <div id="step4" class="step-card bg-white p-6 rounded shadow hidden">
+                    <h2 class="text-lg font-bold text-green-600 mb-4" data-i18n="step4_title">🎉 证书签发成功！</h2>
+                    <p class="text-sm text-gray-600 mb-4" data-i18n="step4_desc">请下载您的证书文件和私钥文件。部署到 Nginx/Apache 即可使用。
+                    </p>
+
+                    <div class="space-y-4">
+                        <!-- Certificate Block -->
+                        <div class="border p-3 rounded bg-gray-50 shadow-sm">
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="font-bold text-xs text-gray-500">CERTIFICATE (PEM)</span>
+                                <div class="flex gap-2">
+                                    <button onclick="copyText(GLOBAL.certPem)"
+                                        class="text-blue-600 text-xs hover:underline font-bold"
+                                        data-i18n="btn_copy_text">复制内容</button>
+                                    <span class="text-gray-300">|</span>
+                                    <button onclick="downloadFile('cert.pem', GLOBAL.certPem)"
+                                        class="text-blue-600 text-xs hover:underline" data-i18n="btn_dl">下载文件</button>
+                                </div>
+                            </div>
+                            <textarea
+                                class="w-full h-24 text-[10px] font-mono border rounded p-2 resize-none bg-white text-gray-600 focus:ring-1 focus:ring-blue-300 focus:outline-none"
+                                readonly id="certDisplay"></textarea>
+                        </div>
+
+                        <!-- Private Key Block -->
+                        <div class="border p-3 rounded bg-gray-50 shadow-sm">
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="font-bold text-xs text-gray-500">PRIVATE KEY (PEM)</span>
+                                <div class="flex gap-2">
+                                    <button onclick="copyText(GLOBAL.domainKeyPem)"
+                                        class="text-red-600 text-xs hover:underline font-bold"
+                                        data-i18n="btn_copy_text">复制内容</button>
+                                    <span class="text-gray-300">|</span>
+                                    <button onclick="downloadFile('private.key', GLOBAL.domainKeyPem)"
+                                        class="text-red-600 text-xs hover:underline" data-i18n="btn_dl">下载文件</button>
+                                </div>
+                            </div>
+                            <textarea
+                                class="w-full h-24 text-[10px] font-mono border rounded p-2 resize-none bg-white text-gray-600 focus:ring-1 focus:ring-red-300 focus:outline-none"
+                                readonly id="keyDisplay"></textarea>
+                        </div>
+
+                        <!-- PFX Export Block -->
+                        <div class="border-t pt-4 mt-2">
+                            <label class="block text-xs font-bold text-gray-500 uppercase mb-2">PFX / PKCS#12 Export
+                                (Windows/IIS/Java)</label>
+                            <div class="flex items-center gap-2">
+                                <input type="password" id="pfxPass" placeholder="PFX Password (Optional)"
+                                    class="border rounded p-2 text-sm flex-1" data-i18n-placeholder="ph_pfx_pass">
+                                <button onclick="downloadPFX()"
+                                    class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded text-sm transition"
+                                    data-i18n="btn_dl_pfx">
+                                    下载 PFX
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- 右侧：实时日志 -->
+            <div class="lg:col-span-1">
+                <div class="bg-gray-900 text-green-400 p-4 rounded shadow h-[600px] overflow-y-auto font-mono text-xs leading-5"
+                    id="logs">
+                    <div class="border-b border-gray-700 pb-2 mb-2 text-gray-500">System Ready...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 注入模态框 -->
+    <div id="injectionModal" class="fixed inset-0 bg-black bg-opacity-80 hidden flex items-center justify-center z-50">
+        <div class="bg-white rounded w-full max-w-3xl p-6 shadow-2xl transform transition-all scale-100">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="font-bold text-lg text-red-600" data-i18n="modal_title">⚠️ 检测到跨域限制 (CORS)</h3>
+                <button onclick="document.getElementById('injectionModal').classList.add('hidden')"
+                    class="text-gray-400 hover:text-gray-600">✕</button>
+            </div>
+            <p class="text-sm text-gray-600 mb-4" data-i18n="modal_desc">由于浏览器安全策略，纯网页无法直接连接目标 ACME
+                接口。请按以下步骤操作，将本工具注入到目标环境运行：</p>
+            <ol class="list-decimal list-inside text-sm text-gray-700 mb-4 space-y-2 bg-gray-50 p-3 rounded border">
+                <li data-i18n="modal_step1">点击下方 <strong>[复制全部代码]</strong> 按钮。</li>
+                <li><span data-i18n="modal_step2_pre">点击打开：</span><a id="targetLink" href="#" target="_blank"
+                        class="text-blue-600 underline font-bold" data-i18n="modal_step2_link">目标 API 页面</a>。</li>
+                <li data-i18n="modal_step3">在目标页面按 <kbd class='bg-gray-200 px-1 rounded border'>F12</kbd> 打开控制台
+                    (Console)。</li>
+                <li class="text-red-600 bg-red-50 p-1 rounded">
+                    <strong data-i18n="modal_step4_strong">重要：</strong><span
+                        data-i18n="modal_step4_text">首次粘贴若被拦截（显示英文警告），请先手动输入 <code
+                            class='bg-white border px-1 rounded text-xs'>allow pasting</code> 并回车解锁。</span>
+                </li>
+                <li data-i18n="modal_step5"><strong>粘贴代码并回车</strong>，本工具将直接在那里运行。</li>
+            </ol>
+            <textarea id="injectionCodeBox"
+                class="w-full h-32 bg-gray-800 text-green-400 p-2 text-xs font-mono mb-4 rounded border border-gray-600 focus:outline-none"
+                readonly></textarea>
+            <div class="flex justify-end gap-3">
+                <button onclick="document.getElementById('injectionModal').classList.add('hidden')"
+                    class="px-4 py-2 text-gray-600 text-sm hover:bg-gray-100 rounded" data-i18n="btn_cancel">取消</button>
+                <button onclick="copyCode()"
+                    class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-bold shadow"
+                    data-i18n="btn_copy">复制全部代码</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- I18N ---
+        const I18N = {
+            zh: {
+                title_main: "SSL 证书免费申请工具", title_sub: "基于 Web Crypto API & ACME 协议 | 纯前端运行", badge_injected: "🚀 注入模式运行中", btn_manual_inject: "🔧 无法连接？点击这里",
+                step1_title: "1. 账户准备 (ACME Account)", label_ca: "选择证书颁发机构 (CA)", opt_le_staging: "Let's Encrypt (测试环境 Staging)", opt_le_prod: "Let's Encrypt (生产环境 Production)", opt_zerossl: "ZeroSSL (需要 EAB 凭证)", opt_google: "Google Trust Services (需要 EAB 凭证)",
+                eab_warning: "⚠️ 该 CA 需要外部账户绑定 (EAB Credentials)", ph_email: "输入邮箱 (you@example.com)", btn_connect: "连接并注册",
+                step2_title: "2. 域名与订单 (Create Order)", label_domains: "申请域名 (支持多个)", ph_domains: "例如: example.com, *.example.com (用逗号或换行分隔)", tip_wildcard: "💡 提示：若需主域名和子域名同时生效，请同时填入 example.com 和 *.example.com。", label_algo: "证书密钥算法", btn_order: "申请订单",
+                step3_title: "3. 验证域名所有权 (DNS Challenge)", dns_guide_pre: "请为以下", dns_guide_suf: "个域名分别添加 TXT 记录：", tip_dns_wait: "💡 提示：添加后请等待 1-2 分钟让 DNS 生效。", btn_verify: "我已添加，点击验证并下载证书", btn_check_dns: "🔍 检查", btn_verifying: "⏳ 验证中...",
+                step4_title: "🎉 证书签发成功！", step4_desc: "请下载您的证书文件和私钥文件。部署到 Nginx/Apache 即可使用。", btn_dl_cert: "下载 证书 (cert.pem)", btn_dl_key: "下载 私钥 (private.key)",
+                modal_title: "⚠️ 检测到跨域限制 (CORS)", modal_desc: "由于浏览器安全策略，纯网页无法直接连接目标 ACME 接口。请按以下步骤操作，将本工具注入到目标环境运行：", modal_step1: "点击下方 <strong>[复制全部代码]</strong> 按钮。", modal_step2_pre: "点击打开：", modal_step2_link: "目标 API 页面", modal_step3: "在目标页面按 <kbd class='bg-gray-200 px-1 rounded border'>F12</kbd> 打开控制台 (Console)。", modal_step4_strong: "重要：", modal_step4_text: "首次粘贴若被拦截（显示英文警告），请先手动输入 <code class='bg-white border px-1 rounded text-xs'>allow pasting</code> 并回车解锁。", modal_step5: "<strong>粘贴代码并回车</strong>，本工具将直接在那里运行。", btn_cancel: "取消", btn_copy: "复制全部代码",
+                msg_conn_dir: "正在连接目录:", msg_conn_fail: "连接失败", msg_dir_ok: "✅ 目录获取成功", msg_gen_acc_key: "生成账户密钥 (ECC P-256)...", msg_gen_eab: "正在生成 EAB 绑定签名...", msg_eab_ok: "✅ EAB 签名生成完毕", msg_acc_ok: "🎉 账户注册/登录成功！ID:", msg_enter_email: "请输入真实有效的邮箱！", msg_enter_eab: "当前选择的 CA 需要 EAB 凭证，请填写完整。", msg_enter_domain: "请输入至少一个域名", msg_order_create: "正在申请订单...", msg_gen_domain_key: "生成域名私钥...", msg_domain_key_ok: "✅ 域名私钥已生成", msg_order_ok: "订单创建成功，需要验证", msg_item: "个项目...", msg_fetch_dns: "正在获取 DNS 验证记录...", msg_dns_gen: "解析记录生成:", msg_skip_dns: "⚠️ 不支持 DNS 验证，跳过:", msg_dns_ready: "✅ 所有 DNS 记录已生成，请前往 DNS 服务商添加。", msg_trigger_verify: "正在触发 CA 验证...", msg_triggered: "已触发验证:", msg_verify_wait: "⏳ 验证请求已全部发送，开始轮询订单状态...", msg_verify_timeout: "❌ 验证超时，请检查 DNS 是否生效", msg_order_status: "订单状态:", msg_verify_ok: "✅ 所有域名验证通过！正在提交 CSR...", msg_verify_fail: "❌ 验证失败 (Order Invalid)！此订单已失效。", msg_verify_fail_detail: "请点击【步骤 2：申请订单】重新生成订单获取新 DNS 记录。", msg_checking_order: "正在检查订单状态...", msg_order_done: "✅ 订单已完成，直接下载证书...", msg_order_process: "⏳ 证书签发中 (Processing)，开始轮询...", msg_order_ready: "📝 订单就绪，正在提交 CSR...", msg_order_abnormal: "⚠️ 订单状态异常:", msg_gen_csr: "正在生成 CSR...", msg_csr_ok: "✅ CSR 生成成功", msg_csr_submit: "⏳ 正在提交 CSR 数据...", msg_csr_submit_wait: "⏳ CSR 已提交，等待签发...", msg_sign_timeout: "❌ 签发超时", msg_dl_cert: "📥 正在下载证书内容...", msg_finish: "🎉🎉🎉 流程结束，请保存文件！", msg_congrats: "恭喜！证书申请成功！", lbl_host: "主机记录 (Host)", lbl_value: "记录值 (Value)", lbl_full: "完整解析名:", lbl_tip: "填写建议:", tip_dns_prefix: "在 DNS 服务商后台，通常只需填这个前缀。",
+                tip_dns_check: "查询中...", tip_dns_ok: "✅ 已生效", tip_dns_fail: "❌ 未查到", tip_dns_err: "⚠️ 查询失败",
+                msg_pfx_fail: "❌ PFX Generation Failed. Forge library missing or context not supported.", msg_copy_ok: "已复制到剪贴板", btn_reset: "重置", btn_reset_title: "重置所有数据并清除缓存"
+            },
+            en: {
+                title_main: "Free SSL Certificate Tool", title_sub: "Web Crypto API & ACME Protocol | Client-Side Only", badge_injected: "🚀 Injection Mode Active", btn_manual_inject: "🔧 Can't connect? Click here",
+                step1_title: "1. Account Preparation (ACME Account)", label_ca: "Select Certificate Authority (CA)", opt_le_staging: "Let's Encrypt (Staging)", opt_le_prod: "Let's Encrypt (Production)", opt_zerossl: "ZeroSSL (Requires EAB)", opt_google: "Google Trust Services (Requires EAB)",
+                eab_warning: "⚠️ EAB Credentials Required", ph_email: "Enter Email (you@example.com)", btn_connect: "Connect & Register",
+                step2_title: "2. Domain & Order (Create Order)", label_domains: "Domains (Multi-support)", ph_domains: "e.g., example.com, *.example.com (comma separated)", tip_wildcard: "💡 Tip: For root & wildcard, enter both example.com and *.example.com.", label_algo: "Key Algorithm", btn_order: "Create Order",
+                step3_title: "3. Verify Ownership (DNS Challenge)", dns_guide_pre: "Please add TXT records for", dns_guide_suf: "domain(s):", tip_dns_wait: "💡 Tip: Wait 1-2 mins after adding DNS records.", btn_verify: "I've Added, Verify & Download", btn_check_dns: "🔍 Check", btn_verifying: "⏳ Verifying...",
+                step4_title: "🎉 Certificate Issued!", step4_desc: "Download your certificate and private key. Deploy to Nginx/Apache.", btn_dl_cert: "Download", btn_dl_key: "Download", btn_copy_text: "Copy Text", btn_dl_pfx: "Download PFX", ph_pfx_pass: "PFX Password (Optional)", tip_pfx: "For Windows Server / IIS / Tomcat.",
+                modal_title: "⚠️ CORS Restriction Detected", modal_desc: "Browser security blocks direct connection. Follow steps to inject this tool:", modal_step1: "Click <strong>[Copy Code]</strong> below.", modal_step2_pre: "Open: ", modal_step2_link: "Target API Page", modal_step3: "Press <kbd class='bg-gray-200 px-1 rounded border'>F12</kbd> on target page to open Console.", modal_step4_strong: "Important: ", modal_step4_text: "If pasting is blocked, type <code class='bg-white border px-1 rounded text-xs'>allow pasting</code> and hit Enter.", modal_step5: "<strong>Paste & Enter</strong> to run the tool there.", btn_cancel: "Cancel", btn_copy: "Copy Code",
+                msg_conn_dir: "Connecting to directory:", msg_conn_fail: "Connection failed", msg_dir_ok: "✅ Directory loaded", msg_gen_acc_key: "Generating Account Key (ECC P-256)...", msg_gen_eab: "Generating EAB signature...", msg_eab_ok: "✅ EAB signature generated", msg_acc_ok: "🎉 Account Registered/Logged in! ID:", msg_enter_email: "Please enter a valid email!", msg_enter_eab: "EAB credentials required for selected CA.", msg_enter_domain: "Please enter at least one domain", msg_order_create: "Creating order...", msg_gen_domain_key: "Generating Domain Key...", msg_domain_key_ok: "✅ Domain Key Generated", msg_order_ok: "Order created, verification required for", msg_item: "items...", msg_fetch_dns: "Fetching DNS records...", msg_dns_gen: "DNS Record:", msg_skip_dns: "⚠️ DNS challenge not supported, skipping:", msg_dns_ready: "✅ DNS records ready. Please add them to your DNS provider.", msg_trigger_verify: "Triggering verification...", msg_triggered: "Triggered:", msg_verify_wait: "⏳ Verification triggered, polling order status...", msg_verify_timeout: "❌ Verification timeout. Check DNS propagation.", msg_order_status: "Order Status:", msg_verify_ok: "✅ All verified! Submitting CSR...", msg_verify_fail: "❌ Verification Failed! Order is Invalid.", msg_verify_fail_detail: "Order is invalid. Please click [Create Order] again to get new DNS records.", msg_checking_order: "Checking order status...", msg_order_done: "✅ Order complete, downloading cert...", msg_order_process: "⏳ Processing... Polling...", msg_order_ready: "📝 Order ready, sending CSR...", msg_order_abnormal: "⚠️ Abnormal order status:", msg_gen_csr: "Generating CSR...", msg_csr_ok: "✅ CSR Generated", msg_csr_submit: "⏳ Submitting CSR data...", msg_csr_submit_wait: "⏳ CSR submitted, waiting for issuance...", msg_sign_timeout: "❌ Issuance timeout", msg_dl_cert: "📥 Downloading certificate content...", msg_finish: "🎉🎉🎉 Finished! Please save files.", msg_congrats: "Success! Certificate Issued.", lbl_host: "Host Record", lbl_value: "Record Value", lbl_full: "Full Name:", lbl_tip: "Suggestion:", tip_dns_prefix: "Usually just enter this prefix in DNS provider.",
+                tip_dns_check: "Checking...", tip_dns_ok: "✅ Propagated", tip_dns_fail: "❌ Not Found", tip_dns_err: "⚠️ Check Failed",
+                msg_pfx_fail: "❌ PFX Generation Failed. Forge library missing or context not supported.", msg_copy_ok: "Copied!", btn_reset: "Reset", btn_reset_title: "Reset all data and clear cache"
+            }
+        };
+
+        let CUR_LANG = localStorage.getItem('ssl_tool_lang') || 'zh';
+        if (!I18N[CUR_LANG]) CUR_LANG = 'zh';
+
+        window.changeLang = function (lang) {
+            CUR_LANG = lang;
+            localStorage.setItem('ssl_tool_lang', lang);
+            document.getElementById('langSelect').value = lang;
+            updatePageText();
+        }
+
+        function t(key) { return I18N[CUR_LANG][key] || key; }
+
+        function updatePageText() {
+            document.querySelectorAll('[data-i18n]').forEach(el => {
+                const key = el.getAttribute('data-i18n');
+                if (I18N[CUR_LANG][key]) el.innerHTML = I18N[CUR_LANG][key];
+            });
+            document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+                const key = el.getAttribute('data-i18n-placeholder');
+                if (I18N[CUR_LANG][key]) el.placeholder = I18N[CUR_LANG][key];
+            });
+            document.querySelectorAll('[data-i18n-title]').forEach(el => {
+                const key = el.getAttribute('data-i18n-title');
+                if (I18N[CUR_LANG][key]) el.title = I18N[CUR_LANG][key];
+            });
+            checkEAB();
+        }
+
+        // --- Persist User Inputs ---
+        function saveInputs() {
+            localStorage.setItem('ssl_tool_email', document.getElementById('emailInput').value);
+            localStorage.setItem('ssl_tool_domains', document.getElementById('domainInput').value);
+            localStorage.setItem('ssl_tool_eab_kid', document.getElementById('eabKid').value);
+            localStorage.setItem('ssl_tool_eab_hmac', document.getElementById('eabHmacKey').value);
+            localStorage.setItem('ssl_tool_dir', document.getElementById('directoryUrl').value);
+            localStorage.setItem('ssl_tool_algo', document.getElementById('keyAlgo').value);
+        }
+
+        function loadInputs() {
+            if (localStorage.getItem('ssl_tool_email')) document.getElementById('emailInput').value = localStorage.getItem('ssl_tool_email');
+            if (localStorage.getItem('ssl_tool_domains')) document.getElementById('domainInput').value = localStorage.getItem('ssl_tool_domains');
+            if (localStorage.getItem('ssl_tool_eab_kid')) document.getElementById('eabKid').value = localStorage.getItem('ssl_tool_eab_kid');
+            if (localStorage.getItem('ssl_tool_eab_hmac')) document.getElementById('eabHmacKey').value = localStorage.getItem('ssl_tool_eab_hmac');
+            if (localStorage.getItem('ssl_tool_dir')) document.getElementById('directoryUrl').value = localStorage.getItem('ssl_tool_dir');
+            if (localStorage.getItem('ssl_tool_algo')) document.getElementById('keyAlgo').value = localStorage.getItem('ssl_tool_algo');
+            checkEAB();
+        }
+
+        window.resetApp = function () {
+            if (confirm('Reset all data and clear cache?')) {
+                localStorage.clear();
+                location.reload();
+            }
+        }
+
+        window.copyText = function (text) {
+            if (!text) return;
+            const el = document.createElement('textarea');
+            el.value = text;
+            document.body.appendChild(el);
+            el.select();
+            document.execCommand('copy');
+            document.body.removeChild(el);
+            alert(t('msg_copy_ok'));
+        }
+
+        // --- DNS Pre-check via Cloudflare DoH ---
+        window.checkDNSPropagation = async function (btn, domain, expectedValue) {
+            const originalText = btn.innerText;
+            btn.disabled = true;
+            btn.innerHTML = `<span class="spinner"></span> ${t('tip_dns_check')}`;
+
+            const host = `_acme-challenge.${domain}`;
+
+            try {
+                const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${host}&type=TXT`, {
+                    headers: { 'Accept': 'application/dns-json' }
+                });
+                const data = await res.json();
+
+                let found = false;
+                if (data.Answer) {
+                    found = data.Answer.some(rec => {
+                        const val = rec.data.replace(/^"|"$/g, '');
+                        return val === expectedValue;
+                    });
+                }
+
+                if (found) {
+                    btn.className = "ml-2 px-2 py-1 bg-green-100 text-green-700 text-xs rounded font-bold border border-green-200 w-20 text-center";
+                    btn.innerText = t('tip_dns_ok');
+                } else {
+                    btn.className = "ml-2 px-2 py-1 bg-red-100 text-red-700 text-xs rounded font-bold border border-red-200 w-20 text-center";
+                    btn.innerText = t('tip_dns_fail');
+                    setTimeout(() => {
+                        btn.disabled = false;
+                        btn.innerText = originalText;
+                        btn.className = "ml-2 px-2 py-1 bg-blue-50 hover:bg-blue-100 text-blue-600 text-xs rounded border border-blue-200 transition whitespace-nowrap w-20 text-center";
+                    }, 3000);
+                }
+            } catch (e) {
+                console.error(e);
+                btn.innerText = t('tip_dns_err');
+                setTimeout(() => { btn.disabled = false; btn.innerText = originalText; }, 3000);
+            }
+        }
+
+        // --- 全局状态 ---
+        window.GLOBAL = {
+            urls: {}, accountKey: null, accountKeyPem: "", accountUrl: "",
+            domainKeyPem: "", domainJwk: null, // NEW: Store JWK for stable key usage
+            orderUrl: "", authUrls: [], challenges: [],
+            nonce: "", domains: [], algo: "RSA", certPem: ""
+        };
+
+        // UI 交互
+        window.checkEAB = function () {
+            const url = document.getElementById('directoryUrl').value;
+            const eabSection = document.getElementById('eabSection');
+            const eabHelp = document.getElementById('eabHelp');
+
+            if (url.includes("zerossl.com") || url.includes("google")) {
+                eabSection.classList.remove('hidden');
+                if (eabHelp) {
+                    if (url.includes("zerossl.com")) {
+                        eabHelp.innerHTML = CUR_LANG === 'zh'
+                            ? 'ZeroSSL 用户：请访问 <a href="https://app.zerossl.com/developer" target="_blank" class="text-blue-600 underline font-bold">Developer Dashboard</a> 点击 "Generate EAB Credentials" 获取。'
+                            : 'ZeroSSL: Visit <a href="https://app.zerossl.com/developer" target="_blank" class="text-blue-600 underline font-bold">Developer Dashboard</a> and click "Generate EAB Credentials".';
+                    } else if (url.includes("google")) {
+                        eabHelp.innerHTML = CUR_LANG === 'zh'
+                            ? 'Google CA 用户：请参考 <a href="https://cloud.google.com/certificate-manager/docs/public-ca-tutorial" target="_blank" class="text-blue-600 underline font-bold">官方文档</a> 在 Google Cloud Shell 中申请。'
+                            : 'Google CA: Refer to <a href="https://cloud.google.com/certificate-manager/docs/public-ca-tutorial" target="_blank" class="text-blue-600 underline font-bold">Official Docs</a> to generate in Cloud Shell.';
+                    } else {
+                        eabHelp.innerHTML = CUR_LANG === 'zh'
+                            ? '请登录 CA 官网控制台获取 KID 和 HMAC Key。'
+                            : 'Login to CA console to get KID & HMAC Key.';
+                    }
+                }
+            } else {
+                eabSection.classList.add('hidden');
+            }
+        }
+
+        // 1. 初始化账户
+        window.initAccount = async function () {
+            saveInputs();
+            const dirUrl = document.getElementById('directoryUrl').value;
+            const email = document.getElementById('emailInput').value;
+
+            if (!email || email.includes('example.com')) return alert(t('msg_enter_email'));
+
+            const eabKid = document.getElementById('eabKid').value.trim();
+            const eabHmac = document.getElementById('eabHmacKey').value.trim();
+            const isEabRequired = !document.getElementById('eabSection').classList.contains('hidden');
+            if (isEabRequired && (!eabKid || !eabHmac)) return alert(t('msg_enter_eab'));
+
+            log(`${t('msg_conn_dir')} ${dirUrl}`);
+            try {
+                const res = await fetch(dirUrl);
+                if (!res.ok) throw new Error("Connection failed");
+                GLOBAL.urls = await res.json();
+                log(t('msg_dir_ok'));
+
+                log(t('msg_gen_acc_key'));
+                GLOBAL.accountKey = await window.crypto.subtle.generateKey(
+                    { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]
+                );
+                GLOBAL.accountKeyPem = await exportPem(GLOBAL.accountKey.privateKey, "PRIVATE KEY");
+
+                await getNonce();
+                const payload = { termsOfServiceAgreed: true, contact: [`mailto:${email}`] };
+
+                if (isEabRequired) {
+                    log(t('msg_gen_eab'));
+                    payload.externalAccountBinding = await generateEAB(eabKid, eabHmac, GLOBAL.accountKey, GLOBAL.urls.newAccount);
+                    log(t('msg_eab_ok'));
+                }
+
+                const jws = await signJWS(payload, GLOBAL.urls.newAccount);
+                const regRes = await fetch(GLOBAL.urls.newAccount, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jws) });
+
+                if (!regRes.ok) throw new Error(await regRes.text());
+
+                GLOBAL.accountUrl = regRes.headers.get('Location');
+                log(`${t('msg_acc_ok')} ${GLOBAL.accountUrl.slice(-10)}...`);
+
+                activeStep(2);
+            } catch (e) {
+                if (e.name === 'TypeError' || e.message.includes('Failed to fetch') || e.message.includes('NetworkError')) {
+                    log("❌ " + t('msg_conn_fail') + ", triggering injection guide...");
+                    showInjectionModal();
+                } else {
+                    handleError(e);
+                }
+            }
+        }
+
+        // 2. 申请订单
+        window.createOrder = async function () {
+            saveInputs();
+            const domainStr = document.getElementById('domainInput').value;
+            const normalizedStr = domainStr.replace(/，/g, ',');
+            const domains = [...new Set(
+                normalizedStr.toLowerCase().split(/[,\s\n]+/).map(d => d.trim()).filter(d => d)
+            )];
+            if (domains.length === 0) return alert(t('msg_enter_domain'));
+
+            GLOBAL.domains = domains;
+            const algo = document.getElementById('keyAlgo').value;
+            GLOBAL.algo = algo;
+
+            // 带有重试机制的订单创建
+            let retryCount = 0;
+            const maxRetries = 3;
+
+            log(`${t('msg_order_create')} (${domains.length} domains, ${algo})`);
+            try {
+                log(`${t('msg_gen_domain_key')} (${algo})...`);
+                let algoParams;
+                if (algo === 'RSA') {
+                    algoParams = { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" };
+                } else {
+                    algoParams = { name: "ECDSA", namedCurve: "P-256" };
+                }
+                const domainKey = await window.crypto.subtle.generateKey(algoParams, true, ["sign", "verify"]);
+                // Export PEM for download
+                GLOBAL.domainKeyPem = await exportPem(domainKey.privateKey, "PRIVATE KEY");
+                // Export JWK for internal usage (Fixes 'd.tohex' issue)
+                GLOBAL.domainJwk = await window.crypto.subtle.exportKey("jwk", domainKey.privateKey);
+
+                log(t('msg_domain_key_ok'));
+
+                const identifiers = domains.map(d => ({ type: "dns", value: d }));
+
+                while (retryCount < maxRetries) {
+                    try {
+                        await getNonce();
+                        const payload = { identifiers: identifiers };
+                        const jws = await signJWS(payload, GLOBAL.urls.newOrder);
+
+                        const ordRes = await fetch(GLOBAL.urls.newOrder, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jws) });
+                        if (!ordRes.ok) throw new Error(await ordRes.text());
+
+                        const ordData = await ordRes.json();
+                        GLOBAL.orderUrl = ordRes.headers.get('Location');
+                        GLOBAL.finalizeUrl = ordData.finalize;
+                        GLOBAL.authUrls = ordData.authorizations;
+
+                        log(`${t('msg_order_ok')} ${GLOBAL.authUrls.length} ${t('msg_item')}`);
+                        await fetchChallenges();
+                        break; // Success, exit loop
+                    } catch (e) {
+                        retryCount++;
+                        if (retryCount >= maxRetries) throw e;
+                        log(`⚠️ Create Order failed, retrying (${retryCount}/${maxRetries})...`);
+                        await new Promise(r => setTimeout(r, 1500));
+                    }
+                }
+
+            } catch (e) { handleError(e); }
+        }
+
+        // 2.1 获取验证详情
+        async function fetchChallenges() {
+            try {
+                GLOBAL.challenges = [];
+                const container = document.getElementById('dnsList');
+                container.innerHTML = '';
+                document.getElementById('dnsCount').innerText = GLOBAL.authUrls.length;
+
+                const jwk = await window.crypto.subtle.exportKey("jwk", GLOBAL.accountKey.publicKey);
+                const thumbprint = await getThumbprint(jwk);
+
+                log(t('msg_fetch_dns'));
+
+                for (let i = 0; i < GLOBAL.authUrls.length; i++) {
+                    const authUrl = GLOBAL.authUrls[i];
+                    let data = null;
+                    let retryCount = 0;
+                    const maxRetries = 3;
+
+                    while (retryCount < maxRetries) {
+                        try {
+                            await getNonce();
+                            const jws = await signJWS("", authUrl);
+                            const res = await fetch(authUrl, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jws) });
+                            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                            data = await res.json();
+                            break;
+                        } catch (e) {
+                            retryCount++;
+                            if (retryCount >= maxRetries) throw e;
+                            log(`⚠️ Fetch challenge failed, retrying...`);
+                            await new Promise(r => setTimeout(r, 1500));
+                        }
+                    }
+
+                    const challenge = data.challenges.find(c => c.type === 'dns-01');
+                    if (!challenge) {
+                        log(`${t('msg_skip_dns')} ${data.identifier.value}`);
+                        continue;
+                    }
+
+                    const token = challenge.token;
+                    const keyAuth = `${token}.${thumbprint}`;
+                    const txtValue = await sha256Base64Url(keyAuth);
+                    const fullHost = `_acme-challenge.${data.identifier.value}`;
+
+                    const domainParts = data.identifier.value.split('.');
+                    let prefixHint = "_acme-challenge";
+                    if (domainParts.length > 2) {
+                        const subPart = domainParts.slice(0, domainParts.length - 2).join('.');
+                        prefixHint = `_acme-challenge.${subPart}`;
+                    }
+
+                    GLOBAL.challenges.push({ url: challenge.url, authUrl: authUrl, domain: data.identifier.value });
+
+                    const row = document.createElement('div');
+                    row.className = "bg-white p-4 rounded border border-gray-200 shadow-sm hover:shadow-md transition-shadow";
+                    row.innerHTML = `
+                    <div class="flex flex-col md:flex-row gap-6">
+                        <div class="flex-1 min-w-0">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="font-bold text-gray-600 text-xs uppercase tracking-wider">${t('lbl_host')}</span>
+                                <span class="text-[10px] text-gray-400">${t('lbl_full')} ${fullHost}</span>
+                            </div>
+                            <div class="relative group">
+                                <code class="block text-red-600 font-mono text-sm break-all select-all bg-red-50 p-3 rounded border border-red-100 cursor-text font-bold">${prefixHint}</code>
+                                <div class="mt-2 text-xs text-gray-500"><p>💡 <strong class="text-gray-700">${t('lbl_tip')}</strong> ${t('tip_dns_prefix')}</p></div>
+                            </div>
+                        </div>
+                        <div class="flex-1 min-w-0">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="font-bold text-gray-600 text-xs uppercase tracking-wider">${t('lbl_value')}</span>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <code class="flex-1 block text-blue-600 font-mono text-sm break-all select-all bg-blue-50 p-3 rounded border border-blue-100 font-bold cursor-text">${txtValue}</code>
+                                <button onclick="checkDNSPropagation(this, '${data.identifier.value}', '${txtValue}')" class="ml-2 px-2 py-1 bg-blue-50 hover:bg-blue-100 text-blue-600 text-xs rounded border border-blue-200 transition whitespace-nowrap w-20 text-center justify-center">
+                                    ${t('btn_check_dns')}
+                                </button>
+                            </div>
+                            <p class="mt-2 text-xs text-gray-400">TXT / TTL Auto</p>
+                        </div>
+                    </div>
+                `;
+                    container.appendChild(row);
+                    log(`[${i + 1}/${GLOBAL.authUrls.length}] ${t('msg_dns_gen')} ${data.identifier.value}`);
+                }
+                document.getElementById('step3').classList.remove('hidden');
+                activeStep(3);
+                log(t('msg_dns_ready'));
+            } catch (e) { handleError(e); }
+        }
+
+        // 3. 验证并签发
+        window.verifyAndFinalize = async function () {
+            const btn = document.querySelector('#step3 button');
+            const originalText = btn.innerText;
+            btn.disabled = true;
+            btn.innerText = t('btn_verifying'); // "⏳ 验证中..."
+
+            log(t('msg_trigger_verify'));
+            try {
+                for (const ch of GLOBAL.challenges) {
+                    await getNonce();
+                    const jws = await signJWS({}, ch.url);
+                    await fetch(ch.url, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jws) });
+                    log(`${t('msg_triggered')} ${ch.domain}`);
+                }
+
+                let attempts = 0;
+                let errorCount = 0; // 连续错误计数器
+
+                const poll = setInterval(async () => {
+                    attempts++;
+                    if (attempts > 60) { // 增加最大轮询次数到 60 (3分钟)
+                        clearInterval(poll);
+                        btn.disabled = false; btn.innerText = originalText;
+                        log(t('msg_verify_timeout'));
+                        return;
+                    }
+
+                    try {
+                        await getNonce();
+                        const jws = await signJWS("", GLOBAL.orderUrl);
+                        const res = await fetch(GLOBAL.orderUrl, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jws) });
+                        const orderData = await res.json();
+
+                        // 成功获取数据，重置错误计数
+                        errorCount = 0;
+
+                        log(`[${attempts}] ${t('msg_order_status')} ${orderData.status}`);
+
+                        if (orderData.status === 'valid' || orderData.status === 'ready') {
+                            clearInterval(poll);
+                            log(t('msg_verify_ok'));
+                            try {
+                                await finalizeOrder(orderData);
+                            } catch (e) {
+                                handleError(e);
+                            } finally {
+                                btn.disabled = false;
+                                btn.innerText = originalText;
+                            }
+                        } else if (orderData.status === 'invalid') {
+                            clearInterval(poll);
+                            btn.disabled = false; btn.innerText = originalText;
+                            log(t('msg_verify_fail'));
+
+                            let errorSummary = "";
+                            if (orderData.authorizations && orderData.authorizations.length > 0) {
+                                log("🔍 正在查询失败原因...");
+                                for (const authUrl of orderData.authorizations) {
+                                    try {
+                                        await getNonce();
+                                        const jwsAuth = await signJWS("", authUrl);
+                                        const resAuth = await fetch(authUrl, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jwsAuth) });
+                                        const authData = await resAuth.json();
+                                        if (authData.status === 'invalid') {
+                                            const failedCh = authData.challenges.find(c => c.status === 'invalid');
+                                            if (failedCh && failedCh.error) {
+                                                const msg = `❌ [${authData.identifier.value}] Error: ${failedCh.error.detail}`;
+                                                log(msg);
+                                                errorSummary += msg + "\n";
+                                            }
+                                        }
+                                    } catch (e) { console.error(e); }
+                                }
+                            }
+                            alert(t('msg_verify_fail_detail') + "\n\n" + errorSummary);
+                        } else if (orderData.status === 'pending') {
+                            // 还在验证中，什么都不做，继续轮询
+                        }
+                    } catch (e) {
+                        errorCount++;
+                        console.warn("Poll error:", e);
+                        // 只有连续失败 5 次才终止，防止单次网络抖动导致流程中断
+                        if (errorCount > 5) {
+                            clearInterval(poll);
+                            btn.disabled = false; btn.innerText = originalText;
+                            handleError(e);
+                        } else {
+                            log(`⚠️ 网络波动 (${errorCount}/5)，正在重试...`);
+                        }
+                    }
+                }, 3000);
+            } catch (e) {
+                btn.disabled = false; btn.innerText = originalText;
+                handleError(e);
+            }
+        }
+
+        async function finalizeOrder(orderData) {
+            if (orderData.status === 'valid') { await downloadCertificate(orderData.certificate); return; }
+            if (orderData.status === 'ready') { await sendCsr(orderData.finalize); }
+        }
+
+        // Helper helper
+        function RawASN1(hex) {
+            KJUR.asn1.ASN1Object.call(this);
+            this.hTLV = hex;
+            this.getEncodedHex = function () { return this.hTLV; };
+        }
+        RawASN1.prototype = new KJUR.asn1.ASN1Object();
+
+        // 4.1 发送 CSR (Ultimate Manual ASN.1 Construction)
+        async function sendCsr(finalizeUrl) {
+            try {
+                log("🔍 Re-verifying order identifiers...");
+                await getNonce();
+                const jwsFetch = await signJWS("", GLOBAL.orderUrl);
+                const resFetch = await fetch(GLOBAL.orderUrl, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jwsFetch) });
+                const orderData = await resFetch.json();
+
+                const identifiers = orderData.identifiers.map(i => i.value);
+                const mainDomain = identifiers[0];
+                const algo = GLOBAL.algo;
+
+                log(`${t('msg_gen_csr')} (SANs: ${identifiers.length}) - Manual ASN.1`);
+                log(`Domains: ${identifiers.join(', ')}`);
+
+                await new Promise(r => setTimeout(r, 50));
+
+                // FIX: Use JWK from GLOBAL state
+                let prvKeyObj = KEYUTIL.getKey(GLOBAL.domainJwk);
+                const sigAlg = algo === 'ECC' ? "SHA256withECDSA" : "SHA256withRSA";
+
+                // --- MANUAL SAN CONSTRUCTION ---
+                let sanContentHex = "";
+                for (let d of identifiers) {
+                    let dHex = "";
+                    for (let i = 0; i < d.length; i++) dHex += d.charCodeAt(i).toString(16).padStart(2, "0");
+
+                    let len = dHex.length / 2;
+                    let lenHex = "";
+                    if (len < 128) lenHex = len.toString(16).padStart(2, "0");
+                    else if (len < 256) lenHex = "81" + len.toString(16).padStart(2, "0");
+                    else lenHex = "82" + len.toString(16).padStart(4, "0");
+
+                    sanContentHex += "82" + lenHex + dHex;
+                }
+
+                let seqLen = sanContentHex.length / 2;
+                let seqLenHex = "";
+                if (seqLen < 128) seqLenHex = seqLen.toString(16).padStart(2, "0");
+                else if (seqLen < 256) seqLenHex = "81" + seqLen.toString(16).padStart(2, "0");
+                else seqLenHex = "82" + seqLen.toString(16).padStart(4, "0");
+
+                let sanValueHex = "30" + seqLenHex + sanContentHex;
+
+                let extSeq = new KJUR.asn1.DERSequence({
+                    array: [
+                        new KJUR.asn1.DERObjectIdentifier({ oid: "2.5.29.17" }),
+                        new KJUR.asn1.DEROctetString({ hex: sanValueHex })
+                    ]
+                });
+
+                let extsSeq = new KJUR.asn1.DERSequence({ array: [extSeq] });
+
+                let extReq = new KJUR.asn1.DERSequence({
+                    array: [
+                        new KJUR.asn1.DERObjectIdentifier({ oid: "1.2.840.113549.1.9.14" }),
+                        new KJUR.asn1.DERSet({ array: [extsSeq] })
+                    ]
+                });
+
+                let attrSet = new KJUR.asn1.DERSet({ array: [extReq] });
+                let attrHex = attrSet.getEncodedHex();
+                attrHex = "a0" + attrHex.substring(2);
+
+                const x500Name = new KJUR.asn1.x509.X500Name({ str: `/CN=${mainDomain}` });
+                const pubKeyInfo = new KJUR.asn1.x509.SubjectPublicKeyInfo(prvKeyObj);
+
+                let infoSeq = new KJUR.asn1.DERSequence({
+                    array: [
+                        new KJUR.asn1.DERInteger({ int: 0 }),
+                        x500Name,
+                        pubKeyInfo,
+                        new RawASN1(attrHex)
+                    ]
+                });
+                let infoHex = infoSeq.getEncodedHex();
+
+                let sig = new KJUR.crypto.Signature({ alg: sigAlg });
+                sig.init(prvKeyObj);
+                sig.updateHex(infoHex);
+                let sigHex = sig.sign();
+
+                let csrSeq = new KJUR.asn1.DERSequence({
+                    array: [
+                        new RawASN1(infoHex),
+                        new KJUR.asn1.x509.AlgorithmIdentifier({ name: sigAlg }),
+                        new KJUR.asn1.DERBitString({ hex: "00" + sigHex })
+                    ]
+                });
+
+                let csrPem = KJUR.asn1.ASN1Util.getPEMStringFromHex(csrSeq.getEncodedHex(), "CERTIFICATE REQUEST");
+                const csrBase64 = csrPem.replace(/-----BEGIN [^-]+-----/, '').replace(/-----END [^-]+-----/, '').replace(/\s+/g, '');
+                const csrBase64Url = csrBase64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+                log(t('msg_csr_ok'));
+                log(t('msg_csr_submit'));
+
+                await getNonce();
+                const jws = await signJWS({ csr: csrBase64Url }, finalizeUrl);
+                const res = await fetch(finalizeUrl, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jws) });
+                const data = await res.json();
+
+                if (!res.ok) {
+                    const errDetail = data.detail || data.type || "Unknown Error";
+                    if (res.status === 403 || (data.type && data.type.includes('error'))) {
+                        log(`⚠️ Submit Response ${res.status}: ${errDetail}. Polling...`);
+                        await pollOrderForCert();
+                        return;
+                    }
+                    throw new Error(data.detail || JSON.stringify(data));
+                }
+
+                if (data.status === 'valid') { await downloadCertificate(data.certificate); }
+                else if (data.status === 'processing') { log(t('msg_csr_submit_wait')); await pollOrderForCert(); }
+                else { throw new Error(t('msg_order_abnormal') + " " + data.status); }
+            } catch (e) {
+                console.error(e);
+                handleError(e);
+            }
+        }
+
+        async function pollOrderForCert() {
+            return new Promise((resolve, reject) => {
+                let attempts = 0;
+                let readyCount = 0;
+                let errorCount = 0;
+
+                const poll = setInterval(async () => {
+                    attempts++;
+                    if (attempts > 30) { clearInterval(poll); log(t('msg_sign_timeout')); reject(new Error("Timeout")); return; }
+                    try {
+                        await getNonce();
+                        const jws = await signJWS("", GLOBAL.orderUrl);
+                        const res = await fetch(GLOBAL.orderUrl, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jws) });
+                        const data = await res.json();
+                        errorCount = 0;
+                        log(`[Cert] ${t('msg_order_status')} ${data.status} (${attempts})`);
+
+                        if (data.status === 'valid') {
+                            clearInterval(poll);
+                            await downloadCertificate(data.certificate);
+                            resolve();
+                        } else if (data.status === 'invalid') {
+                            clearInterval(poll);
+                            log("❌ Invalid Order");
+                            resolve();
+                        } else if (data.status === 'ready') {
+                            readyCount++;
+                            if (readyCount > 2) {
+                                clearInterval(poll);
+                                log("⚠️ Order stuck in ready, retrying CSR submission...");
+                                await sendCsr(data.finalize);
+                                resolve();
+                            }
+                        }
+                    } catch (e) {
+                        errorCount++;
+                        if (errorCount > 5) {
+                            clearInterval(poll); handleError(e); reject(e);
+                        } else {
+                            log(`⚠️ Net error (${errorCount}/5)...`);
+                        }
+                    }
+                }, 3000);
+            });
+        }
+
+        async function downloadCertificate(certUrl) {
+            log(t('msg_dl_cert'));
+            await getNonce();
+            const jws = await signJWS("", certUrl);
+            const res = await fetch(certUrl, { method: 'POST', headers: acmeHeader(), body: JSON.stringify(jws) });
+            const pem = await res.text();
+
+            GLOBAL.certPem = pem;
+
+            if (document.getElementById('keyDisplay')) {
+                document.getElementById('keyDisplay').value = GLOBAL.domainKeyPem;
+            }
+            if (document.getElementById('certDisplay')) {
+                document.getElementById('certDisplay').value = pem;
+            }
+
+            document.getElementById('step4').classList.remove('hidden');
+            document.getElementById('step3').classList.add('done');
+            activeStep(4);
+
+            log(t('msg_finish'));
+            setTimeout(() => { alert(t('msg_congrats')); }, 200);
+        }
+
+        window.downloadPFX = function () {
+            const pass = document.getElementById('pfxPass').value || "";
+            if (typeof forge === 'undefined') {
+                alert(t('msg_pfx_fail'));
+                return;
+            }
+            try {
+                const cert = forge.pki.certificateFromPem(GLOBAL.certPem);
+                const privateKey = forge.pki.privateKeyFromPem(GLOBAL.domainKeyPem);
+                const p12Asn1 = forge.pkcs12.toPkcs12Asn1(
+                    [{ cert: cert, key: privateKey, friendlyName: 'certificate' }],
+                    pass
+                );
+                const p12Der = forge.asn1.toDer(p12Asn1).getBytes();
+                const p12B64 = forge.util.encode64(p12Der);
+
+                const element = document.createElement('a');
+                element.setAttribute('href', 'data:application/x-pkcs12;base64,' + p12B64);
+                element.setAttribute('download', 'certificate.pfx');
+                document.body.appendChild(element); element.click(); document.body.removeChild(element);
+            } catch (e) {
+                console.error(e);
+                alert("PFX Error: " + e.message);
+            }
+        }
+
+        // --- Helper Functions ---
+        // Helper to retry non-ce fetch requests if they fail transiently (excluding nonce/signing as those handle themselves or are atomic)
+        // Used in fetchChallenges mainly
+
+        async function generateEAB(kid, hmacKeyStr, accountKey, newAccountUrl) {
+            const hmacKeyBytes = base64UrlToUint8Array(hmacKeyStr);
+            const hmacKey = await window.crypto.subtle.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+            const publicJwk = await window.crypto.subtle.exportKey("jwk", accountKey.publicKey);
+            const acmeJwk = { crv: publicJwk.crv, kty: publicJwk.kty, x: publicJwk.x, y: publicJwk.y };
+            const payloadB64 = stringToBase64Url(JSON.stringify(acmeJwk));
+            const protectedB64 = stringToBase64Url(JSON.stringify({ alg: "HS256", kid: kid, url: newAccountUrl }));
+            const signatureBuffer = await window.crypto.subtle.sign("HMAC", hmacKey, new TextEncoder().encode(`${protectedB64}.${payloadB64}`));
+            return { protected: protectedB64, payload: payloadB64, signature: arrayBufferToBase64Url(signatureBuffer) };
+        }
+        function base64UrlToUint8Array(base64Url) {
+            const padding = '='.repeat((4 - base64Url.length % 4) % 4);
+            const base64 = (base64Url + padding).replace(/-/g, '+').replace(/_/g, '/');
+            const rawData = window.atob(base64);
+            const outputArray = new Uint8Array(rawData.length);
+            for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
+            return outputArray;
+        }
+        function stringToBase64Url(str) { return arrayBufferToBase64Url(new TextEncoder().encode(str)); }
+
+        // Retry wrapper for getNonce to handle flaky network
+        async function getNonce() {
+            let retries = 3;
+            while (retries > 0) {
+                try {
+                    const res = await fetch(GLOBAL.urls.newNonce, { method: 'HEAD' });
+                    GLOBAL.nonce = res.headers.get('replay-nonce');
+                    return;
+                } catch (e) {
+                    retries--;
+                    if (retries === 0) throw e;
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+            }
+        }
+
+        async function signJWS(payload, url) {
+            const jwkExport = await window.crypto.subtle.exportKey("jwk", GLOBAL.accountKey.publicKey);
+            const acmeJwk = { crv: jwkExport.crv, kty: jwkExport.kty, x: jwkExport.x, y: jwkExport.y };
+            const header = { alg: "ES256", jwk: acmeJwk, nonce: GLOBAL.nonce, url: url };
+            if (GLOBAL.accountUrl && url !== GLOBAL.urls.newAccount) { delete header.jwk; header.kid = GLOBAL.accountUrl; }
+            const sJWS = KJUR.jws.JWS.sign(null, header, payload === "" ? "" : payload, GLOBAL.accountKeyPem);
+            const [h, p, s] = sJWS.split('.');
+            return { protected: h, payload: p, signature: s };
+        }
+        async function getThumbprint(jwk) {
+            const ordered = { crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y };
+            const hash = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(ordered)));
+            return arrayBufferToBase64Url(hash);
+        }
+        function sha256Base64Url(str) { return window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(str)).then(arrayBufferToBase64Url); }
+        function arrayBufferToBase64Url(buffer) {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+            return window.btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+        }
+        async function exportPem(key, type) {
+            const exported = await window.crypto.subtle.exportKey("pkcs8", key);
+            const exportedAsString = String.fromCharCode(...new Uint8Array(exported));
+            const exportedAsBase64 = window.btoa(exportedAsString);
+            return `-----BEGIN ${type}-----\n${exportedAsBase64.match(/.{1,64}/g).join('\n')}\n-----END ${type}-----`;
+        }
+        function acmeHeader() { return { 'Content-Type': 'application/jose+json' }; }
+        function log(msg) {
+            const box = document.getElementById('logs');
+            box.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            box.scrollTop = box.scrollHeight;
+        }
+        function handleError(e) { log(`<span class="text-red-400">Error: ${e.message}</span>`); console.error(e); alert("操作失败，请查看日志"); }
+        function activeStep(n) {
+            document.querySelectorAll('.step-card').forEach(el => el.classList.remove('active'));
+            document.getElementById('step' + n).classList.add('active');
+            if (n > 1) document.getElementById('step' + (n - 1)).classList.add('done');
+        }
+        window.downloadFile = function (filename, text) {
+            const element = document.createElement('a');
+            element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
+            element.setAttribute('download', filename);
+            document.body.appendChild(element); element.click(); document.body.removeChild(element);
+        }
+        // 注入初始化
+        if (window.location.hostname.includes('letsencrypt.org') || window.location.hostname.includes('zerossl') || window.location.hostname.includes('google')) document.body.classList.add('injected');
+        window.showInjectionModal = function () {
+            const url = document.getElementById('directoryUrl').value;
+            document.getElementById('targetLink').href = url;
+            const safeHtml = document.documentElement.outerHTML.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\${/g, '\\${');
+            document.getElementById('injectionCodeBox').value = `document.open();document.write(\`${safeHtml}\`);document.close();setTimeout(()=>{document.body.classList.add('injected')},500);`;
+            document.getElementById('injectionModal').classList.remove('hidden');
+        }
+        window.copyCode = function () {
+            document.getElementById("injectionCodeBox").select();
+            document.execCommand("copy");
+            alert("Code Copied!");
+        }
+        // 自动匹配
+        const currentHost = window.location.hostname;
+        const dirSelect = document.getElementById('directoryUrl');
+        if (currentHost.includes('zerossl')) dirSelect.value = "https://acme.zerossl.com/v2/DV90/directory";
+        else if (currentHost.includes('google')) dirSelect.value = "https://dv.acme-v02.api.pki.goog/directory";
+        else if (currentHost.includes('letsencrypt')) dirSelect.value = window.location.href.includes('staging') ? "https://acme-staging-v02.api.letsencrypt.org/directory" : "https://acme-v02.api.letsencrypt.org/directory";
+
+        // 初始化语言
+        loadInputs();
+        changeLang(CUR_LANG);
+    </script>
+</body>
+
+</html>
